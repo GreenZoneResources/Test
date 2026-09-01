@@ -1,0 +1,10 @@
+## .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+
+## Secrets
+*.pfx
+appsettings.*.local.json
