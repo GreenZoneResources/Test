@@ -156,6 +156,17 @@ default (US-17); only `login`/`callback` are `[AllowAnonymous]`.
   first place) and architecturally (nothing in this codebase exposes it).
 - Bulk requests are capped (500 items/request) so one submission can't be
   used to exhaust the downstream service or this API's own thread pool.
+- The Statement Service itself requires a service-account login (its own
+  username/password, unrelated to staff SSO) before it accepts any call.
+  That login is enforced transport-level, not by controller/service code:
+  `StatementServiceAuthHandler`, a `DelegatingHandler` registered on
+  `IStatementServiceClient`'s `HttpClient`, attaches a valid bearer token to
+  every outgoing request automatically. `StatementServiceAuthenticator`
+  (singleton — its cached token and refresh lock must be shared process-wide)
+  performs the actual login only when the cached token is missing or close to
+  expiry, so this doesn't add a login round-trip to every statement request.
+  There is no code path from `StatementsController` to the Statement Service
+  that can skip this — it isn't a check anything can forget to call.
 
 ## 6. Audit trail (Epics 6–8)
 
