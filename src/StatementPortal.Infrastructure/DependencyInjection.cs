@@ -5,11 +5,9 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using StatementPortal.Application.Audit;
-using StatementPortal.Application.Permissions;
 using StatementPortal.Application.Statements;
 using StatementPortal.Infrastructure.Auth;
 using StatementPortal.Infrastructure.Persistence;
-using StatementPortal.Infrastructure.Sso;
 using StatementPortal.Infrastructure.StatementService;
 
 namespace StatementPortal.Infrastructure;
@@ -20,7 +18,6 @@ public static class DependencyInjection
         this IServiceCollection services, IConfiguration configuration)
     {
         services.AddHttpContextAccessor();
-        services.AddMemoryCache();
 
         services.AddDbContext<StatementPortalDbContext>(options =>
             options.UseSqlServer(
@@ -36,16 +33,13 @@ public static class DependencyInjection
         services.AddScoped<IValidator<SingleStatementRequestDto>, SingleStatementRequestValidator>();
         services.AddScoped<IValidator<BulkStatementRequestDto>, BulkStatementRequestValidator>();
 
-        services.Configure<SsoOptions>(configuration.GetSection(SsoOptions.SectionName));
         services.Configure<StatementServiceOptions>(configuration.GetSection(StatementServiceOptions.SectionName));
 
-        services.AddScoped<IPermissionService, PermissionService>();
-
-        // Named/typed clients get the standard resilience handler (retry with
-        // jitter, circuit breaker, and an overall timeout) so a slow or flaky
-        // downstream never cascades into thread-pool starvation on the portal.
-        services.AddHttpClient<ISsoClient, SsoClient>()
-            .AddStandardResilienceHandler();
+        // Resource-server authentication: validates SSO-issued bearer tokens
+        // locally (no outbound call to SSO at request time) and derives
+        // permissions from the token's own appRoles claim — see
+        // AuthenticationExtensions and AppRolesClaimsMiddleware.
+        services.AddStatementPortalAuthentication();
 
         // Dedicated named client for the service-account login call itself —
         // kept separate from the main Statement Service client so the auth

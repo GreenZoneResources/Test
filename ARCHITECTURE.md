@@ -9,13 +9,13 @@ added later against the contract below without changing this backend.
 
 | Concern | Choice | Why |
 |---|---|---|
-| Runtime | .NET 9 / ASP.NET Core Web API | Matches the existing LotusBank stack (Scalar, `AddOpenApi`, Serilog). |
-| Auth | Existing LotusBank SSO (delegated), cookie-based local session | Reuses AD/Graph integration that already exists; portal never re-implements AD auth. |
-| Session store | Redis (`IDistributedCache` + custom `ITicketStore`) | Needed for *true* server-side session revocation (US-02, US-18) — see §3. |
-| Database | SQL Server / EF Core | Matches existing infra; audit table needs relational filtering (US-14). |
-| Downstream statement engine | Existing Statement Service, called over HTTP | Per project decision — treated as an external REST dependency, wrapped by an adapter interface. |
-| Resilience | `Microsoft.Extensions.Http.Resilience` (standard handler: retry + circuit breaker + timeout) | SSO and the Statement Service are both external dependencies on the request's critical path. |
-| Logging | Serilog → Console + Seq | Structured, queryable logs; separate from the audit trail (below). |
+| Runtime | .NET 9 / ASP.NET Core Web API | Matches the existing LotusBank stack (Swagger, Serilog). |
+| Auth | Local JWT Bearer validation — this service **is** the authority on who/what for its own endpoints | See §3: it validates SSO-issued tokens itself rather than calling back to SSO at request time. |
+| Database | SQL Server / EF Core | Matches existing infra; audit table needs relational filtering (US-14). Also the same DB SSO's `GetTokenSettings` reads, for the shared signing key. |
+| Downstream statement engine | Existing Statement Service, called over HTTP | Per project decision — treated as an external REST dependency, wrapped by an adapter interface. Requires its own service-account login (§5). |
+| Resilience | `Microsoft.Extensions.Http.Resilience` (standard handler: retry + circuit breaker + timeout) | The Statement Service is an external dependency on the request's critical path. |
+| API docs | Swagger (Swashbuckle) with a Bearer security scheme | Lets a token be pasted into Swagger UI directly for testing protected endpoints. |
+| Logging | Serilog → Console + Seq | Structured, queryable logs; separate from the audit trail (below). Every auth failure (401/403) logs through `ILogger`, not `Console.WriteLine`, specifically so it's visible in Seq. |
 
 **Audit trail vs. application logs — deliberately two different systems.**
 Serilog/Seq is for operational diagnostics (exceptions, latency, request
@@ -36,22 +36,20 @@ src/
     Entities/AuditRecord.cs        immutable: constructor-only, no Update/Delete methods
 
   StatementPortal.Application/     use cases, interfaces, validation — no EF/HTTP here
-    Common/ICurrentUserContext.cs  identity resolved from the session, never from request input
+    Common/ICurrentUserContext.cs  identity resolved from the validated token, never from request input
     Common/AccountNumberMasker.cs  masks at the point of use (US-11)
     Audit/IAuditWriter.cs          append-only
     Audit/AuditDtos.cs             IAuditQueryService — read-only
     Statements/                    DTOs, FluentValidation rules, IStatementServiceClient (adapter interface)
-    Permissions/IPermissionService.cs
 
-  StatementPortal.Infrastructure/  EF Core, HTTP clients, Redis, SSO integration
+  StatementPortal.Infrastructure/  EF Core, HTTP clients, auth
     Persistence/                   StatementPortalDbContext, AuditRepository (implements both audit interfaces)
-    Sso/                           SsoClient (OAuth2 code+PKCE against existing SSO), PermissionService (cached)
-    StatementService/              StatementServiceClient (typed HttpClient, resilience-wrapped)
-    Auth/                          DistributedCacheTicketStore, CurrentUserContext
+    Auth/                          JwtSigningKeyProvider, AppRolesClaimsMiddleware, AuthenticationExtensions, CurrentUserContext
+    StatementService/              StatementServiceClient, StatementServiceAuthenticator + AuthHandler (service-account login)
 
   StatementPortal.Api/             composition root
-    Program.cs                    auth, authorization policies, rate limiting, security headers, CORS
-    Controllers/                  AuthController, StatementsController, AuditController
+    Program.cs                    auth, authorization policies, rate limiting, security headers, CORS, Swagger
+    Controllers/                  MeController, StatementsController, AuditController
     Authorization/                 permission-claim policy handler
     Middleware/                    security headers, global exception handling
 ```
@@ -60,63 +58,74 @@ Dependency direction is strictly inward: `Api → Infrastructure → Application
 Domain`. Nothing in `Application` or `Domain` references EF Core, HTTP, or
 ASP.NET Core — that keeps the business rules (validation, masking, audit
 shape) testable without spinning up a database, and keeps the Statement
-Service/SSO integration swappable behind their interfaces.
+Service integration swappable behind its interface.
 
-## 3. Authentication & session design (Epic 1, Epic 10)
+## 3. Authentication design (Epic 1, Epic 10) — local JWT validation, no SSO call at request time
 
-The portal does **not** talk to Active Directory. It delegates to the
-existing SSO service and only consumes the result — this is a
-**Backend-for-Frontend (BFF)** pattern:
+This service does **not** talk to Active Directory, and — unlike the
+project's earlier BFF design — it also does **not** call out to SSO over the
+network to authenticate a request. It is a pure **resource server**: SSO
+already authenticated the staff member and issued a JWT (the `CustomJwt`
+scheme used across the LotusBank services, HS256-signed with a key shared via
+the same `[dbo].[GetTokenSettings]` stored procedure SSO itself reads); this
+service validates that token **locally**, using the same signing key, issuer,
+and audience. There is no login, callback, or logout endpoint here at all —
+those concerns belong entirely to SSO.
 
 ```
-Browser                StatementPortal.Api              LotusBank SSO
-   |  GET /api/auth/login    |                                |
-   |------------------------>|                                |
-   |   302 → SSO authorize   |  (state + PKCE challenge set,   |
-   |<------------------------|   verifier kept server-side)    |
-   |------------------------------------------------------------------>|
-   |                         |         staff authenticates via AD      |
-   |<------------------------------------------------------------------|
-   |  302 → /api/auth/callback?code=...&state=...                      |
-   |------------------------>|                                |
-   |                         |  POST code+verifier (server-to-server)  |
-   |                         |----------------------------------------->|
-   |                         |<-----------------------------------------|
-   |                         |  validate JWT (issuer/audience/JWKS)     |
-   |                         |  fetch permissions, build ClaimsPrincipal|
-   |  Set-Cookie: __Host-StatementPortal.Session (HttpOnly, Secure,     |
-   |  SameSite=Strict) — opaque key into Redis-backed ticket store      |
-   |<------------------------|                                |
+Browser/Frontend          StatementPortal.Api
+      |  request + Authorization: Bearer <token>   |
+      |  (or the "access-token" cookie SSO set)     |
+      |--------------------------------------------->|
+      |                    JwtBearer validates the token locally:
+      |                    issuer/audience/signature/expiry
+      |                    (signing key cached after first DB load
+      |                     — see JwtSigningKeyProvider)
+      |                    AppRolesClaimsMiddleware extracts this
+      |                    app's roles from the token's "appRoles"
+      |                    claim → permission claims
+      |                    PermissionAuthorizationHandler enforces
+      |                    the endpoint's required policy
+      |<---------------------------------------------|
 ```
 
-Why this matters for the acceptance criteria specifically:
+This directly resolves a real production issue hit while building this
+service: the previous design called SSO's `/auth-me` endpoint over HTTPS on
+every request, and that outbound call was failing with TLS handshake errors
+in the deployed environment. Validating the token locally removes that call
+entirely — there is nothing left to fail on that network path.
 
-- **US-01** (AD auth) is satisfied by SSO itself; the portal's job is to
-  reject anyone SSO doesn't vouch for, and separately reject anyone SSO
-  vouches for but who has zero portal permissions ("unauthorized staff
-  access" — `AuthController.Callback` returns `403` when `permissions.Count
-  == 0`).
-- **US-02** ("cookie should not expose authentication information to
-  client-side JavaScript") — the SSO-issued token is exchanged and validated
-  entirely server-side inside `SsoClient`; it never appears in a response the
-  browser can read. The browser only ever receives `__Host-*` cookie:
-  `HttpOnly`, `Secure`, `SameSite=Strict`.
-- **US-02 session expiry / US-18 logout** — plain ASP.NET Core cookie auth is
-  self-contained (the ticket lives inside the cookie), so a server can't
-  truly revoke a session before its cryptographic expiry. `DistributedCacheTicketStore`
-  (an `ITicketStore` backed by Redis) makes the cookie an opaque lookup key
-  instead: `SignOutAsync` deletes the Redis entry immediately, so the very
-  next request with that cookie is rejected — not just eventually, but on the
-  next request.
-- PKCE (RFC 7636) on the code exchange closes the classic
-  authorization-code-interception gap.
+- **`JwtSigningKeyProvider`** loads the issuer/audience/key from the database
+  the first time a token needs validating, then caches it for the rest of the
+  process's lifetime (double-checked locking via `SemaphoreSlim`). This is
+  deliberately *not* loaded via `builder.Services.BuildServiceProvider()...Result`
+  at host-startup time — that pattern blocks the entire app from starting on a
+  synchronous DB round trip and spins up a throwaway second DI container just
+  to fetch one value. Here, a DB outage delays the *first* authenticated
+  request, not the whole app's ability to start.
+- **`AppRolesClaimsMiddleware`** runs right after `UseAuthentication()`. SSO's
+  `appRoles` claim lists roles across *every* application the staff member has
+  access to, not just this one — the middleware filters to the entry whose
+  `ApplicationName` matches `Authentication:ApplicationName` (config) before
+  turning those roles into this app's own `permission` claims. Flattening
+  every app's roles together, as a naive port of SSO's own role-extraction
+  code would do, would let a role granted in a completely unrelated
+  application leak into this service's authorization decisions.
+- **Seq visibility (US-10-adjacent, operational)** — `OnAuthenticationFailed`,
+  `OnChallenge`, and `OnForbidden` all log through `ILogger`, not
+  `Console.WriteLine`, with the request path and reason. Combined with
+  `UseSerilogRequestLogging()`, every 401/403 on any endpoint is queryable in
+  Seq without needing to reproduce it.
+- **US-01** ("unauthorized staff access") is satisfied by
+  `AppRolesClaimsMiddleware` returning `403` when the token has no `appRoles`
+  entry for this application at all.
 
 ## 4. RBAC (Epic 2)
 
-Permissions come back from SSO/entitlements as a string list per staff ID,
-cached 5 minutes (`PermissionService`), and are baked into the session's
-`ClaimsPrincipal` as repeated `permission` claims at sign-in time. Enforcement
-is **policy-based**, not role-string-based, so a new permission is one enum
+Permissions live entirely inside the validated JWT (`appRoles` claim,
+filtered to this application by `AppRolesClaimsMiddleware`) — there is no
+separate permissions lookup, cache, or network call. Enforcement is
+**policy-based**, not role-string-based, so a new permission is one enum
 value + one policy registration:
 
 ```csharp
@@ -128,14 +137,14 @@ made. The doc's explicit callout —
 
 > Frontend visibility must not be treated as the authorization mechanism.
 
-— is why `GET /api/auth/me` (module visibility for the landing page) and the
-real enforcement on `POST /api/statements/single` are two different code
-paths: `me` only tells the UI what to *render*; every state-changing endpoint
-re-checks the policy independently, so a modified/replayed request from an
-unprivileged session is rejected regardless of what the UI showed.
+— is why `GET /api/me` (module visibility for the landing page) and the real
+enforcement on `POST /api/statements/single` are two different code paths:
+`me` only tells the UI what to *render*; every state-changing endpoint
+re-checks the policy independently against the token's own claims, so a
+modified/replayed request is rejected regardless of what the UI showed.
 
-The global `FallbackPolicy` requires authentication for *every* endpoint by
-default (US-17); only `login`/`callback` are `[AllowAnonymous]`.
+The global `FallbackPolicy` requires a validated bearer token for *every*
+endpoint by default (US-17) — nothing in this service is anonymous.
 
 ## 5. Statement generation (Epics 3–5)
 
@@ -200,17 +209,14 @@ regardless of what a caller requests.
 
 ## 7. Cross-cutting security (Epic 9 + general hardening)
 
-- **Deny-by-default authorization** — global `FallbackPolicy` requires an
-  authenticated session; nothing is reachable anonymously except the two auth
-  endpoints.
+- **Deny-by-default authorization** — global `FallbackPolicy` requires a
+  validated bearer token; nothing in this service is anonymous.
 - **IP capture integrity** — `ForwardedHeadersOptions.KnownProxies` is
   populated explicitly from config; `X-Forwarded-For` is trusted only from
   that list, so a client can't spoof the IP address that lands in the audit
   trail by sending its own `X-Forwarded-For` header.
-- **Rate limiting** — fixed-window limiters on `/api/auth/*` (by IP, blunts
-  credential-stuffing against the login/callback flow) and
-  `/api/statements/*` (by staff ID once authenticated, blunts scripted abuse
-  of statement generation).
+- **Rate limiting** — a fixed-window limiter on `/api/statements/*` (by staff
+  ID from the validated token) blunts scripted abuse of statement generation.
 - **Security headers** — `SecurityHeadersMiddleware` strips `Server`/
   `X-Powered-By`, sets `X-Content-Type-Options`, `X-Frame-Options: DENY`,
   a restrictive `Content-Security-Policy` (this is a pure JSON API, so
@@ -220,8 +226,9 @@ regardless of what a caller requests.
   message on unhandled exceptions; details go to Serilog only, never to the
   response body.
 - **CORS** — explicit origin allow-list (`AllowedOrigins` config), credentials
-  enabled only for those origins, method allow-list (`GET`/`POST`).
-- **Resilience** — SSO and Statement Service calls go through
+  enabled only for those origins (needed for the SSO-issued `access-token`
+  cookie), method allow-list (`GET`/`POST`).
+- **Resilience** — Statement Service calls go through
   `AddStandardResilienceHandler()` (retry with jitter, circuit breaker,
   timeout), so a slow/flaky downstream degrades instead of cascading into
   thread-pool exhaustion on the portal.
@@ -252,17 +259,18 @@ AuditRecords
 ```
 
 No `Permissions`/`Users` table exists in this database — RBAC is resolved
-live from SSO and cached in memory, not persisted locally, so there is
-nothing here to keep in sync with SSO's own user store.
+directly from the validated token's own `appRoles` claim, not persisted
+locally, so there is nothing here to keep in sync with SSO's own user store.
 
 ## 9. API surface
 
+This service has no login/callback/logout endpoints — SSO owns the entire
+authentication lifecycle; every route below requires a bearer token SSO
+already issued.
+
 | Method | Route | Policy | Story |
 |---|---|---|---|
-| GET | `/api/auth/login` | anonymous | US-01 |
-| GET | `/api/auth/callback` | anonymous | US-01 |
-| POST | `/api/auth/logout` | authenticated | US-18 |
-| GET | `/api/auth/me` | authenticated | US-03/US-04 |
+| GET | `/api/me` | authenticated | US-03/US-04 |
 | POST | `/api/statements/single` | `SingleStatement` | US-05/US-06 |
 | POST | `/api/statements/bulk` | `BulkStatement` | US-07/US-08 |
 | GET | `/api/audit` | `Audit` | US-12/US-13/US-14 |
@@ -276,12 +284,11 @@ dotnet restore StatementPortal.sln
 
 # 2. Local secrets (never appsettings.json)
 cd src/StatementPortal.Api
-dotnet user-secrets set "Sso:ClientSecret" "<value>"
-dotnet user-secrets set "StatementService:ApiKey" "<value>"
+dotnet user-secrets set "StatementService:Username" "<value>"
+dotnet user-secrets set "StatementService:Password" "<value>"
 dotnet user-secrets set "Seq:ApiKey" "<value>"          # optional
 
 # 3. Dependencies
-docker run -d -p 6379:6379 redis:7
 docker run -d -e ACCEPT_EULA=Y -p 5341:5341 -p 8080:8080 datalust/seq:latest
 
 # 4. Database
@@ -295,19 +302,26 @@ dotnet run
 
 ## 11. Integration points intentionally left open
 
-Two external contracts weren't available to shape exactly, so both are
-isolated behind a single interface each — adjust the implementation, not the
-callers, once the real contract is confirmed:
+External contracts weren't available to shape exactly, so each is isolated
+behind a single interface/class — adjust the implementation, not the callers,
+once the real contract is confirmed:
 
-- **`ISsoClient`** (`Infrastructure/Sso/SsoClient.cs`) assumes a standard
-  OAuth2 authorization-code + PKCE flow with a JWKS endpoint for signature
-  validation. If the existing SSO exposes something else (e.g. a bespoke
-  token format, a different claim naming scheme), only this file changes.
+- **`CurrentUserContext`** (`Infrastructure/Auth/CurrentUserContext.cs`) reads
+  `ClaimTypes.NameIdentifier` for staff id (confirmed against SSO's own
+  `TokenValidationParameters.NameClaimType`) but guesses at the claim names
+  for staff name/branch (`ClaimTypes.Name`, a `"branch"` claim). Confirm
+  against a real SSO-issued token and adjust.
+- **`AppRolesClaimsMiddleware`** assumes the `appRoles` claim deserializes to
+  a JSON array of `{ ApplicationName, Roles[] }` objects, and that this app is
+  registered under `ApplicationName: "StatementPortal"` — adjust
+  `Authentication:ApplicationName` (config) or the shape in
+  `GroupedRoleEntry` if SSO's actual claim differs.
 - **`IStatementServiceClient`** (`Infrastructure/StatementService/StatementServiceClient.cs`)
   assumes `POST api/statements/single` / `api/statements/bulk` with a
-  JSON body and an `X-Request-Id` header. Adjust to the real Statement
-  Service's contract the same way.
+  JSON body and an `X-Request-Id` header, and `StatementServiceAuthenticator`
+  assumes a `POST {AuthPath}` login returning `{ token, expires, tokenType }`.
+  Adjust to the real Statement Service's contract the same way.
 
-Everything upstream of those two classes (validation, RBAC, audit, the
-controllers) is independent of those specifics and shouldn't need to change
-when the real contracts are confirmed.
+Everything upstream of those (validation, RBAC, audit, the controllers) is
+independent of those specifics and shouldn't need to change when the real
+contracts are confirmed.

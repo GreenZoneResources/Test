@@ -1,3 +1,4 @@
+using System.Security.Claims;
 using Microsoft.AspNetCore.Http;
 using StatementPortal.Application.Common;
 
@@ -5,18 +6,29 @@ namespace StatementPortal.Infrastructure.Auth;
 
 public static class PortalClaimTypes
 {
-    public const string StaffId = "staff_id";
-    public const string StaffName = "staff_name";
-    public const string Branch = "branch";
+    /// <summary>
+    /// Not present on the incoming SSO token — added locally by
+    /// AppRolesClaimsMiddleware after filtering the token's "appRoles" claim
+    /// down to this application's own roles. This is the only claim type this
+    /// service itself ever adds; everything else is read as SSO put it there.
+    /// </summary>
     public const string Permission = "permission";
+
+    /// <summary>
+    /// Best-effort guess pending confirmation against a real SSO-issued token —
+    /// the pasted ServiceManager only confirms NameIdentifier (staff id) and
+    /// appRoles. Adjust this to whatever claim actually carries branch, if any.
+    /// </summary>
+    public const string Branch = "branch";
 }
 
 /// <summary>
-/// Reads identity strictly from the authenticated ClaimsPrincipal built at
-/// sign-in (see AuthController) and from the server-resolved remote IP — never
-/// from request headers/body a client could set arbitrarily. This is the only
-/// implementation of ICurrentUserContext in the solution, so every audit entry
-/// and permission check is grounded in the same trusted source.
+/// Reads identity strictly from the ClaimsPrincipal the JWT Bearer handler
+/// builds from SSO's token (see AuthenticationExtensions) plus the locally-added
+/// permission claims (see AppRolesClaimsMiddleware) — never from anything a
+/// client could set on the request itself. This is the only implementation of
+/// ICurrentUserContext in the solution, so every audit entry and permission
+/// check is grounded in the same trusted source.
 /// </summary>
 public sealed class CurrentUserContext : ICurrentUserContext
 {
@@ -28,11 +40,13 @@ public sealed class CurrentUserContext : ICurrentUserContext
     private HttpContext Context =>
         _httpContextAccessor.HttpContext ?? throw new InvalidOperationException("No active HTTP context.");
 
-    public string StaffId => RequireClaim(PortalClaimTypes.StaffId);
+    // NameClaimType is configured to ClaimTypes.NameIdentifier in
+    // JwtSigningKeyProvider, matching SSO's own TokenValidationParameters.
+    public string StaffId => RequireClaim(ClaimTypes.NameIdentifier);
 
-    public string StaffName => RequireClaim(PortalClaimTypes.StaffName);
+    public string StaffName => Context.User.FindFirst(ClaimTypes.Name)?.Value ?? string.Empty;
 
-    public string Email => Context.User.FindFirst(System.Security.Claims.ClaimTypes.Email)?.Value ?? string.Empty;
+    public string Email => Context.User.FindFirst(ClaimTypes.Email)?.Value ?? string.Empty;
 
     public string? Branch => Context.User.FindFirst(PortalClaimTypes.Branch)?.Value;
 

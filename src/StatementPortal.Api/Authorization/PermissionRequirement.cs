@@ -48,7 +48,7 @@ public static class PortalPolicies
         options.AddPolicy(Audit, p =>
             p.Requirements.Add(new PermissionRequirement(ModulePermission.Audit)));
 
-        // Everything not explicitly [AllowAnonymous] requires at minimum an
-        // authenticated session — see Program.cs FallbackPolicy.
+        // Everything not explicitly [AllowAnonymous] requires at minimum a
+        // validated bearer token — see Program.cs FallbackPolicy.
     }
 }
