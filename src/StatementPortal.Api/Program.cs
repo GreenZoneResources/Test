@@ -115,15 +115,14 @@ app.UseSecurityHeaders();
 app.UseCustomExceptionHandling();
 app.UseSerilogRequestLogging(); // every request's final status code (including 401/403) lands in Seq here.
 
-if (app.Environment.IsDevelopment())
-{
-    app.UseSwagger();
-    app.UseSwaggerUI(options => options.DocumentTitle = "Statement Generation Portal API");
-}
-else
-{
+// Available in every environment, not just Development — this is an internal
+// API behind CORS/rate limiting already, and the team wants it reachable for
+// testing against non-local deployments too.
+app.UseSwagger();
+app.UseSwaggerUI(options => options.DocumentTitle = "Statement Generation Portal API");
+
+if (!app.Environment.IsDevelopment())
     app.UseHsts();
-}
 
 app.UseHttpsRedirection();
 app.UseRouting();
