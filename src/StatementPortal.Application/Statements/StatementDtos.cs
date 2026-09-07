@@ -8,17 +8,22 @@ public sealed class SingleStatementRequestDto
     public string Format { get; init; } = "PDF";
 }
 
-public sealed class BulkStatementItemDto
-{
-    public string AccountNumber { get; init; } = default!;
-    public DateOnly StartDate { get; init; }
-    public DateOnly EndDate { get; init; }
-}
-
+/// <summary>
+/// Bulk submission is a file upload (an account list, format owned by the
+/// Statement Service) plus a notification email — not a JSON array of items.
+/// This service does not parse the file; it forwards it to the Statement
+/// Service as-is (see IStatementServiceClient.SubmitBulkAsync), so this DTO
+/// only needs enough to do that forwarding. It uses Stream rather than
+/// ASP.NET Core's IFormFile deliberately — this project (Application) has no
+/// framework dependency, and the API layer (StatementsController) is where
+/// IFormFile gets unwrapped into this shape.
+/// </summary>
 public sealed class BulkStatementRequestDto
 {
-    public IReadOnlyList<BulkStatementItemDto> Items { get; init; } = Array.Empty<BulkStatementItemDto>();
-    public string Format { get; init; } = "PDF";
+    public string Email { get; init; } = default!;
+    public Stream FileContent { get; init; } = default!;
+    public string FileName { get; init; } = default!;
+    public string ContentType { get; init; } = default!;
 }
 
 public sealed class StatementResultDto

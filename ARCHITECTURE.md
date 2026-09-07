@@ -106,11 +106,25 @@ entirely — there is nothing left to fail on that network path.
 - **`AppRolesClaimsMiddleware`** runs right after `UseAuthentication()`. SSO's
   `appRoles` claim lists roles across *every* application the staff member has
   access to, not just this one — the middleware filters to the entry whose
-  `ApplicationName` matches `Authentication:ApplicationName` (config) before
-  turning those roles into this app's own `permission` claims. Flattening
-  every app's roles together, as a naive port of SSO's own role-extraction
-  code would do, would let a role granted in a completely unrelated
-  application leak into this service's authorization decisions.
+  `ApplicationName` matches `Authentication:ApplicationName` (config; the real
+  value is `"Statement Generation Portal"` — confirmed against a live intranet
+  permissions payload) before turning those roles into this app's own
+  `permission` claims. Flattening every app's roles together, as a naive port
+  of SSO's own role-extraction code would do, would let a role granted in a
+  completely unrelated application leak into this service's authorization
+  decisions.
+- Real SSO role names are business labels (e.g. `"COMPLIANCE - SGPORTAL"`),
+  not this app's `ModulePermission` names — `Authentication:RolePermissionMap`
+  (config) maps one to the other, so provisioning a new role is a config
+  change, not a code change. A role with no entry in the map is logged and
+  grants nothing; it is never silently trusted as-is. **Never** add a raw
+  `[Authorize(Roles = "...")]` attribute alongside the existing
+  `[Authorize(Policy = ...)]` on a controller action — ASP.NET Core requires
+  *every* `[Authorize]` attribute on an action to pass, and the built-in
+  `Roles` check reads `ClaimTypes.Role`, a claim type this app never
+  populates (permissions live in a custom `permission` claim instead) — so
+  stacking the two makes the endpoint permanently unreachable regardless of
+  the role-permission map being correct.
 - **Seq visibility (US-10-adjacent, operational)** — `OnAuthenticationFailed`,
   `OnChallenge`, and `OnForbidden` all log through `ILogger`, not
   `Console.WriteLine`, with the request path and reason. Combined with
@@ -163,8 +177,24 @@ endpoint by default (US-17) — nothing in this service is anonymous.
   from directly invoking the Statement Service" is enforced structurally
   (the service isn't reachable from outside the backend's network in the
   first place) and architecturally (nothing in this codebase exposes it).
-- Bulk requests are capped (500 items/request) so one submission can't be
-  used to exhaust the downstream service or this API's own thread pool.
+- **Bulk submission is a file upload, not a JSON array.** `POST
+  /api/statements/bulk` takes `multipart/form-data` (`email` + `file`), and
+  this service does not parse the file at all — `StatementServiceClient`
+  forwards it byte-for-byte to the Statement Service's own bulk endpoint via
+  `MultipartFormDataContent`. `BulkStatementRequestDto` (Application layer)
+  represents the file as a plain `Stream`, not ASP.NET Core's `IFormFile` —
+  unwrapping `IFormFile` into that shape happens in `StatementsController`,
+  keeping the Application project free of a framework dependency.
+  `FluentValidation` here only checks the email address, file name, and
+  content type (CSV/Excel); the controller separately rejects an oversized
+  upload (10 MB) before the file is even opened, and the file's actual
+  row-level content is the Statement Service's problem, not this one's.
+- `GET /api/statements/sample-file?format=csv` returns a template for that
+  upload. **Its columns are a placeholder** (`AccountNumber, StartDate,
+  EndDate`) pending confirmation of the Statement Service's real expected
+  bulk-file layout — update `StatementsController.SampleFile` once that's
+  known. Only `format=csv` is implemented; `xlsx` returns 400 until an actual
+  Excel-writing dependency is worth adding.
 - The Statement Service itself requires a service-account login (its own
   username/password, unrelated to staff SSO) before it accepts any call.
   That login is enforced transport-level, not by controller/service code:
@@ -206,6 +236,21 @@ action exists on it, matching level 2 above at the API surface too. `US-14`'s
 combined filters (date range, staff, branch, module, activity, status) are
 ANDed in `AuditRepository.SearchAsync`; page size is capped at 100 server-side
 regardless of what a caller requests.
+
+**Response envelope.** Both audit endpoints wrap their payload in
+`ApiResponse<T>` (`{ success, message, data, errorCode }`), per the frontend's
+contract — this is the one place in the API that uses this envelope; the
+other endpoints return their DTOs directly (see
+`docs/StatementPortal-Frontend-Integration-Guide.pdf` for how that split
+actually looks in practice).
+`PagedResult<T>` (the `data` on the search endpoint) now also computes
+`TotalPages`/`HasPreviousPage`/`HasNextPage` rather than leaving the frontend
+to derive them from `TotalCount`/`PageSize`. The previously-separate
+`AuditRecordDetailDto` was merged into `AuditRecordDto` (it only added
+`FailureReason`) so `GET /api/audit` and `GET /api/audit/{id}` return the same
+item shape either way — `GetById` now just returns
+`ApiResponse<AuditRecordDto>` with a single item as `data`, not a paged
+structure.
 
 ## 7. Cross-cutting security (Epic 9 + general hardening)
 
@@ -272,7 +317,8 @@ already issued.
 |---|---|---|---|
 | GET | `/api/me` | authenticated | US-03/US-04 |
 | POST | `/api/statements/single` | `SingleStatement` | US-05/US-06 |
-| POST | `/api/statements/bulk` | `BulkStatement` | US-07/US-08 |
+| POST | `/api/statements/bulk` (multipart/form-data) | `BulkStatement` | US-07/US-08 |
+| GET | `/api/statements/sample-file?format=csv` | `BulkStatement` | (bulk-upload helper, not a story) |
 | GET | `/api/audit` | `Audit` | US-12/US-13/US-14 |
 | GET | `/api/audit/{id}` | `Audit` | US-15 |
 
@@ -312,15 +358,20 @@ once the real contract is confirmed:
   for staff name/branch (`ClaimTypes.Name`, a `"branch"` claim). Confirm
   against a real SSO-issued token and adjust.
 - **`AppRolesClaimsMiddleware`** assumes the `appRoles` claim deserializes to
-  a JSON array of `{ ApplicationName, Roles[] }` objects, and that this app is
-  registered under `ApplicationName: "StatementPortal"` — adjust
-  `Authentication:ApplicationName` (config) or the shape in
-  `GroupedRoleEntry` if SSO's actual claim differs.
+  a JSON array of `{ ApplicationName, Roles[] }` objects — confirmed against a
+  real payload (`ApplicationName: "Statement Generation Portal"`). What's
+  still unconfirmed is the *complete* set of real role names beyond
+  `"COMPLIANCE - SGPORTAL"` — `Authentication:RolePermissionMap` currently
+  only maps that one role to `Audit`; add entries for whatever roles actually
+  grant `SingleStatement`/`BulkStatement` once known.
 - **`IStatementServiceClient`** (`Infrastructure/StatementService/StatementServiceClient.cs`)
-  assumes `POST api/statements/single` / `api/statements/bulk` with a
-  JSON body and an `X-Request-Id` header, and `StatementServiceAuthenticator`
-  assumes a `POST {AuthPath}` login returning `{ token, expires, tokenType }`.
-  Adjust to the real Statement Service's contract the same way.
+  assumes `POST api/statements/single` takes a JSON body, `POST
+  api/statements/bulk` takes `multipart/form-data` (`email` + `file`,
+  forwarded as-is), both with an `X-Request-Id` header, and
+  `StatementServiceAuthenticator` assumes a `POST {AuthPath}` login returning
+  `{ token, expires, tokenType }`. Adjust to the real Statement Service's
+  contract the same way. The bulk sample-file's column layout
+  (`StatementsController.SampleFile`) is a placeholder for the same reason.
 
 Everything upstream of those (validation, RBAC, audit, the controllers) is
 independent of those specifics and shouldn't need to change when the real

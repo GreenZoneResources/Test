@@ -43,10 +43,17 @@ public sealed class StatementServiceClient : IStatementServiceClient
     public async Task<BulkStatementResultDto> SubmitBulkAsync(
         Guid requestId, BulkStatementRequestDto request, CancellationToken cancellationToken)
     {
-        using var message = new HttpRequestMessage(HttpMethod.Post, "api/statements/bulk")
-        {
-            Content = JsonContent.Create(request)
-        };
+        // The uploaded file is forwarded as-is — this service does not parse
+        // it, the Statement Service's own bulk endpoint does.
+        using var content = new MultipartFormDataContent();
+        content.Add(new StringContent(request.Email), "email");
+
+        var streamContent = new StreamContent(request.FileContent);
+        if (!string.IsNullOrWhiteSpace(request.ContentType))
+            streamContent.Headers.ContentType = MediaTypeHeaderValue.Parse(request.ContentType);
+        content.Add(streamContent, "file", request.FileName);
+
+        using var message = new HttpRequestMessage(HttpMethod.Post, "api/statements/bulk") { Content = content };
         message.Headers.Add("X-Request-Id", requestId.ToString());
 
         using var response = await _httpClient.SendAsync(message, cancellationToken);

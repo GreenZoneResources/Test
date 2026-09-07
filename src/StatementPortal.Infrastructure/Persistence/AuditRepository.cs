@@ -97,35 +97,18 @@ public sealed class AuditRepository : IAuditWriter, IAuditQueryService
         };
     }
 
-    public async Task<AuditRecordDetailDto?> GetByIdAsync(long id, CancellationToken cancellationToken)
+    public async Task<AuditRecordDto?> GetByIdAsync(long id, CancellationToken cancellationToken)
     {
         var record = await _context.AuditRecords
             .AsNoTracking()
             .FirstOrDefaultAsync(x => x.Id == id, cancellationToken);
 
-        if (record is null)
-            return null;
-
-        return new AuditRecordDetailDto
-        {
-            Id = record.Id,
-            RequestId = record.RequestId,
-            StaffName = record.StaffName,
-            StaffId = record.StaffId,
-            Module = record.Module,
-            Email = record.Email,
-            Branch = record.Branch,
-            Activity = record.Activity,
-            MaskedAccountNumber = record.MaskedAccountNumber,
-            StatementDateRange = FormatRange(record.StatementStartDate, record.StatementEndDate),
-            Date = DateOnly.FromDateTime(record.OccurredAtUtc.UtcDateTime),
-            Time = TimeOnly.FromDateTime(record.OccurredAtUtc.UtcDateTime),
-            Status = record.Status.ToString(),
-            IpAddress = record.IpAddress,
-            FailureReason = record.FailureReason
-        };
+        return record is null ? null : ToDto(record);
     }
 
+    // Single mapping used by both the list and detail reads — the two DTOs
+    // were merged into one shape at the frontend's request, so there's no
+    // longer a reason for GetById to build a differently-shaped object.
     private static AuditRecordDto ToDto(AuditRecord record) => new()
     {
         Id = record.Id,
@@ -141,7 +124,8 @@ public sealed class AuditRepository : IAuditWriter, IAuditQueryService
         Date = DateOnly.FromDateTime(record.OccurredAtUtc.UtcDateTime),
         Time = TimeOnly.FromDateTime(record.OccurredAtUtc.UtcDateTime),
         Status = record.Status.ToString(),
-        IpAddress = record.IpAddress
+        IpAddress = record.IpAddress,
+        FailureReason = record.FailureReason
     };
 
     private static string? FormatRange(DateOnly? start, DateOnly? end) =>

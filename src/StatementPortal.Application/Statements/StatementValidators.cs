@@ -32,39 +32,32 @@ public sealed class SingleStatementRequestValidator : AbstractValidator<SingleSt
     }
 }
 
-public sealed class BulkStatementItemValidator : AbstractValidator<BulkStatementItemDto>
-{
-    public BulkStatementItemValidator()
-    {
-        RuleFor(x => x.AccountNumber).NotEmpty().Matches(@"^\d{10}$");
-
-        RuleFor(x => x.EndDate)
-            .LessThanOrEqualTo(_ => DateOnly.FromDateTime(DateTime.UtcNow));
-
-        RuleFor(x => x)
-            .Must(x => x.StartDate <= x.EndDate)
-            .WithMessage("Start date must not be after end date.");
-    }
-}
-
 public sealed class BulkStatementRequestValidator : AbstractValidator<BulkStatementRequestDto>
 {
-    // Keeps a single request bounded so one submission can't be used to exhaust
-    // the downstream Statement Service or the portal's own request pipeline.
-    private const int MaxBulkItems = 500;
+    private static readonly string[] AllowedContentTypes =
+    [
+        "text/csv",
+        "application/vnd.ms-excel",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    ];
 
     public BulkStatementRequestValidator()
     {
-        RuleFor(x => x.Items)
+        RuleFor(x => x.Email)
             .NotEmpty()
-            .WithMessage("At least one statement item is required.")
-            .Must(items => items.Count <= MaxBulkItems)
-            .WithMessage($"A bulk request cannot contain more than {MaxBulkItems} items.");
+            .EmailAddress()
+            .WithMessage("A valid notification email is required.");
 
-        RuleForEach(x => x.Items).SetValidator(new BulkStatementItemValidator());
+        RuleFor(x => x.FileName)
+            .NotEmpty()
+            .WithMessage("The uploaded file must have a file name.");
 
-        RuleFor(x => x.Format)
-            .Must(f => f is "PDF" or "CSV")
-            .WithMessage("Format must be PDF or CSV.");
+        RuleFor(x => x.ContentType)
+            .Must(ct => AllowedContentTypes.Contains(ct, StringComparer.OrdinalIgnoreCase))
+            .WithMessage("File must be a CSV or Excel (.xlsx/.xls) file.");
+
+        // File size is checked in the controller, before the stream is ever
+        // read here — see StatementsController.Bulk — since that's the
+        // cheapest place to reject an oversized upload.
     }
 }

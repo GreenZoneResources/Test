@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using StatementPortal.Api.Authorization;
 using StatementPortal.Application.Audit;
+using StatementPortal.Application.Common;
 using StatementPortal.Domain.Enums;
 
 namespace StatementPortal.Api.Controllers;
@@ -48,13 +49,20 @@ public sealed class AuditController : ControllerBase
         };
 
         var result = await _auditQueryService.SearchAsync(request, cancellationToken);
-        return Ok(result);
+        return Ok(ApiResponse<PagedResult<AuditRecordDto>>.Ok(result));
     }
 
     [HttpGet("{id:long}")]
     public async Task<IActionResult> GetById(long id, CancellationToken cancellationToken)
     {
         var record = await _auditQueryService.GetByIdAsync(id, cancellationToken);
-        return record is null ? NotFound() : Ok(record);
+
+        if (record is null)
+        {
+            return NotFound(ApiResponse<AuditRecordDto>.Fail(
+                "Audit record not found.", "AUDIT_RECORD_NOT_FOUND"));
+        }
+
+        return Ok(ApiResponse<AuditRecordDto>.Ok(record));
     }
 }

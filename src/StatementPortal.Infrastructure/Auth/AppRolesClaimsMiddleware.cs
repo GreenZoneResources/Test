@@ -26,12 +26,23 @@ public sealed class AppRolesClaimsMiddleware : IMiddleware
     private const string AppRolesClaimType = "appRoles";
 
     private readonly string _applicationName;
+    private readonly IReadOnlyDictionary<string, string[]> _rolePermissionMap;
     private readonly ILogger<AppRolesClaimsMiddleware> _logger;
 
     public AppRolesClaimsMiddleware(IConfiguration configuration, ILogger<AppRolesClaimsMiddleware> logger)
     {
         _applicationName = configuration["Authentication:ApplicationName"]
             ?? throw new InvalidOperationException("Authentication:ApplicationName is not configured.");
+
+        // Real SSO role names are business labels (e.g. "COMPLIANCE - SGPORTAL"),
+        // not this app's ModulePermission names — this map translates one to the
+        // other so a newly-provisioned role only needs a config change here,
+        // never a code change or a hardcoded string on a controller.
+        _rolePermissionMap = configuration
+            .GetSection("Authentication:RolePermissionMap")
+            .GetChildren()
+            .ToDictionary(c => c.Key, c => c.Get<string[]>() ?? [], StringComparer.OrdinalIgnoreCase);
+
         _logger = logger;
     }
 
@@ -79,7 +90,27 @@ public sealed class AppRolesClaimsMiddleware : IMiddleware
             var thisAppEntry = entries?.FirstOrDefault(e =>
                 string.Equals(e.ApplicationName, _applicationName, StringComparison.OrdinalIgnoreCase));
 
-            return thisAppEntry?.Roles.ToList() ?? [];
+            if (thisAppEntry is null)
+                return [];
+
+            var permissions = new List<string>();
+
+            foreach (var role in thisAppEntry.Roles)
+            {
+                if (_rolePermissionMap.TryGetValue(role, out var mapped))
+                {
+                    permissions.AddRange(mapped);
+                }
+                else
+                {
+                    _logger.LogWarning(
+                        "Staff {StaffId} holds role {Role} in {ApplicationName}, but it has no entry in " +
+                        "Authentication:RolePermissionMap — it grants no permission here until one is added.",
+                        staffId, role, _applicationName);
+                }
+            }
+
+            return permissions.Distinct().ToList();
         }
         catch (JsonException ex)
         {
